@@ -164,10 +164,6 @@ For very large repositories:
 - Adjust `--max_size` to exclude large files
 - Use `--ignore-list` for custom exclusions
 
-## License
-
-[Add your license here]
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
