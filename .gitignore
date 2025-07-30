@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
+.tox/
+dist/
+build/
+*.egg-info/
+*.egg
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+
+# Logs
+*.log
+
+# Tiktoken cache
+.cache/tiktoken/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# Backup files
+*.bak
+*.backup
+
+# Personal PowerShell profiles
+*.PowerShell_profile.ps1
+Microsoft.PowerShell_profile.ps1
+
+.claude
