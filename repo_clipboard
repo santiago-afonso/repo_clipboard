@@ -230,6 +230,83 @@ def load_file_list_non_git(root_dir: Path, verbose: bool = True) -> list:
     return files
 
 
+def load_files_by_include_patterns(repo_root: Path, include_patterns: list, is_git_repo: bool, verbose: bool = True) -> list:
+    """Efficiently load files that match include patterns without scanning entire filesystem."""
+    if verbose:
+        if is_git_repo:
+            print(f"Using include patterns to efficiently find files in git repository")
+        else:
+            print(f"Using include patterns to efficiently find files in {repo_root}")
+    
+    files = []
+    
+    if is_git_repo:
+        # For git repos, we can use git ls-files with pathspec patterns for efficiency
+        try:
+            # Use git ls-files with the include patterns as pathspecs
+            for pattern in include_patterns:
+                git_command = ["git", "ls-files", "-c", "-o", "--exclude-standard", pattern]
+                result = subprocess.run(
+                    git_command,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=repo_root,
+                )
+                for line in result.stdout.splitlines():
+                    if line.strip():
+                        file_path = repo_root / line.strip()
+                        if file_path not in files:  # Avoid duplicates
+                            files.append(file_path)
+        except subprocess.CalledProcessError as exc:
+            if verbose:
+                print(f"Warning: git ls-files failed, falling back to pathspec matching: {exc}")
+            # Fallback to pathspec matching
+            return _fallback_to_pathspec_matching(repo_root, include_patterns, verbose)
+    else:
+        # For non-git repos, use pathlib glob patterns
+        for pattern in include_patterns:
+            try:
+                # Convert gitignore-style patterns to glob patterns
+                glob_pattern = pattern
+                # Handle some common gitignore patterns
+                if pattern.startswith('/'):
+                    glob_pattern = pattern[1:]
+                if '**' not in pattern and not pattern.endswith('/'):
+                    # Add recursive matching for file patterns
+                    glob_results = list(repo_root.rglob(glob_pattern))
+                else:
+                    glob_results = list(repo_root.glob(glob_pattern))
+                
+                for path in glob_results:
+                    if path.is_file() and path not in files:
+                        files.append(path)
+            except Exception as exc:
+                if verbose:
+                    print(f"Warning: glob pattern '{pattern}' failed: {exc}")
+    
+    return files
+
+
+def _fallback_to_pathspec_matching(repo_root: Path, include_patterns: list, verbose: bool = True) -> list:
+    """Fallback method using pathspec matching (requires scanning filesystem)."""
+    if verbose:
+        print("Falling back to pathspec matching (scanning filesystem)")
+    
+    # Get all files first (this is what we're trying to avoid, but needed as fallback)
+    files = []
+    for path in repo_root.rglob('*'):
+        if path.is_file():
+            files.append(path)
+    
+    # Apply include patterns
+    include_spec = pathspec.PathSpec.from_lines('gitwildmatch', include_patterns)
+    relative_files = [f.relative_to(repo_root) for f in files]
+    filtered_relative = [f for f in relative_files if include_spec.match_file(f)]
+    
+    return [repo_root / f for f in filtered_relative]
+
+
 def build_tree(paths: list, repo_root: Path) -> Dict[str, Union[dict, Path]]:
     tree: Dict[str, Union[dict, Path]] = {}
     for path in paths:
@@ -378,14 +455,8 @@ def main() -> None:
     
     if is_git_repo:
         repo_root = get_git_root(current_dir)
-        # Load file list with gitignore handling
-        files = load_file_list(repo_root, args.git_ignore, verbose=not args.llm)
     else:
         repo_root = current_dir
-        # In non-git mode, we can't respect gitignore
-        if args.git_ignore and not args.llm:
-            print("Warning: --git-ignore flag is ignored in non-git directories")
-        files = load_file_list_non_git(repo_root, verbose=not args.llm)
 
     allowed_extensions = {
         ext.strip().lstrip('.')
@@ -412,9 +483,33 @@ def main() -> None:
     if args.only_include_list:
         include_patterns.extend(load_patterns_from_file(Path(args.only_include_list)))
     
-    # Apply pathspec filters
-    if ignore_patterns or include_patterns:
-        files = apply_pathspec_filters(files, repo_root, ignore_patterns, include_patterns)
+    # Determine the most efficient file loading strategy
+    # If we only have include patterns (no custom ignore patterns), use optimized loading
+    # Note: We still allow common ignore patterns with optimized loading since they can be handled efficiently
+    has_custom_ignore_patterns = bool(args.ignore_list)
+    can_use_optimized_loading = include_patterns and not has_custom_ignore_patterns
+    
+    if can_use_optimized_loading:
+        # Use optimized loading that only finds files matching include patterns
+        files = load_files_by_include_patterns(repo_root, include_patterns, is_git_repo, verbose=not args.llm)
+        
+        # Apply common ignore patterns after optimized loading (more efficient than full scan)
+        if ignore_patterns:
+            files = apply_pathspec_filters(files, repo_root, ignore_patterns, [])
+    else:
+        # Use traditional approach: load all files then filter
+        if is_git_repo:
+            # Load file list with gitignore handling
+            files = load_file_list(repo_root, args.git_ignore, verbose=not args.llm)
+        else:
+            # In non-git mode, we can't respect gitignore
+            if args.git_ignore and not args.llm:
+                print("Warning: --git-ignore flag is ignored in non-git directories")
+            files = load_file_list_non_git(repo_root, verbose=not args.llm)
+        
+        # Apply pathspec filters
+        if ignore_patterns or include_patterns:
+            files = apply_pathspec_filters(files, repo_root, ignore_patterns, include_patterns)
 
     selected = []
     for f in files:
