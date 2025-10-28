@@ -163,6 +163,16 @@ def parse_args() -> argparse.Namespace:
             "FILE LIST & TOKEN ESTIMATES\n"
             "  - Add --print-files to list included files with approximate token counts.\n"
             "  - In --llm mode, the list prints to stderr (to keep stdout clean).\n"
+            "\n"
+            "SNIPPETS\n"
+            "  - Include file fragments with --snippet 'path:start[-end]'. Supported forms:\n"
+            "      • Single line: path:N\n"
+            "      • Open-end:   path:N-   (from N to EOF)\n"
+            "      • Open-start: path:-M   (from start to M)\n"
+            "      • Bounded:    path:N-M\n"
+            "  - Repeat --snippet as needed, or use --snippets-file (one spec per line; '#' and blank lines ignored).\n"
+            "  - Use --snippets-only to include only snippets and prevent inclusion of non-snippet files.\n"
+            "  - Snippets appear as <file ... snippet_from=\"...\" start=\"N\" end=\"M\"> in the XML (no content headers).\n"
         ),
     )
     parser.add_argument(
@@ -221,6 +231,29 @@ def parse_args() -> argparse.Namespace:
         "--print-files",
         action="store_true",
         help="Print the list of included files (stderr in --llm mode)",
+    )
+    parser.add_argument(
+        "--snippet",
+        action="append",
+        help=(
+            "Include a file snippet specified as 'path:start[-end]'. Supports single line (N), open-end (N-),"
+            " open-start (-M), and bounded (N-M) ranges. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--snippets-file",
+        type=str,
+        help=(
+            "Path to a file containing one snippet spec per line in the form 'path:start[-end]'."
+            " Lines starting with '#' or blank lines are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--snippets-only",
+        action="store_true",
+        help=(
+            "Only include snippets specified via --snippet/--snippets-file; prevents inclusion of non-snippet files."
+        ),
     )
     return parser.parse_args()
 
@@ -364,6 +397,7 @@ def generate_xml(
     node: Dict[str, Union[dict, Path]],
     indent: int = 0,
     file_contents: Optional[Dict[Path, str]] = None,
+    snippet_meta: Optional[Dict[Path, Tuple[str, int, int]]] = None,
 ) -> str:
     lines = []
     for name, child in sorted(node.items()):
@@ -382,7 +416,14 @@ def generate_xml(
                 except Exception as e:
                     print(f"Could not read {child}: {e}", file=sys.stderr)
                     content = ""
-            lines.append(f"{prefix}<file name=\"{name}\">{content}</file>")
+            # Add snippet attributes when available
+            if snippet_meta is not None and child in snippet_meta:
+                src, s_start, s_end = snippet_meta[child]
+                lines.append(
+                    f"{prefix}<file name=\"{name}\" snippet_from=\"{src}\" start=\"{s_start}\" end=\"{s_end}\">{content}</file>"
+                )
+            else:
+                lines.append(f"{prefix}<file name=\"{name}\">{content}</file>")
     return "\n".join(lines)
 
 
@@ -592,24 +633,26 @@ def main() -> None:
         if ignore_regex or include_regex:
             files = apply_regex_filters(files, current_dir, ignore_regex, include_regex)
 
-        selected = []
-        for f in files:
-            if allowed_extensions is not None and f.suffix.lstrip('.') not in allowed_extensions:
-                if not args.llm:
-                    print(f"Skipping {f} due to extension")
-                continue
-            try:
-                size = f.stat().st_size
-            except FileNotFoundError:
-                continue
-            if size > max_bytes:
-                print(f"Skipping {f} due to size {size} bytes")
-                continue
-            selected.append(f)
+        selected: List[Path] = []
+        if not args.snippets_only:
+            for f in files:
+                if allowed_extensions is not None and f.suffix.lstrip('.') not in allowed_extensions:
+                    if not args.llm:
+                        print(f"Skipping {f} due to extension")
+                    continue
+                try:
+                    size = f.stat().st_size
+                except FileNotFoundError:
+                    continue
+                if size > max_bytes:
+                    print(f"Skipping {f} due to size {size} bytes")
+                    continue
+                selected.append(f)
 
         file_display_entries: List[Tuple[str, Path]] = []
         file_contents: Dict[Path, str] = {}
         file_token_estimates: Dict[Path, Optional[int]] = {}
+        snippet_meta: Dict[Path, Tuple[str, int, int]] = {}
 
         for file_path in selected:
             try:
@@ -632,6 +675,108 @@ def main() -> None:
                     file_token_estimates[file_path] = int(raw_tokens * 1.2)
             file_contents[file_path] = content
 
+        # Parse and include snippet entries
+        def _parse_snippet_spec(spec: str) -> Optional[Tuple[Path, Optional[int], Optional[int]]]:
+            try:
+                if ':' not in spec:
+                    print(f"Warning: invalid snippet spec (missing ':'): {spec}", file=sys.stderr)
+                    return None
+                p_str, rng = spec.split(':', 1)
+                p_str = p_str.strip()
+                rng = rng.strip()
+                p = (current_dir / p_str) if not os.path.isabs(p_str) else Path(p_str)
+                if not p.exists() or not p.is_file():
+                    print(f"Warning: snippet source not found or not a file: {p_str}", file=sys.stderr)
+                    return None
+                # Forms: N, N-, -M, N-M
+                start: Optional[int] = None
+                end: Optional[int] = None
+                if '-' in rng:
+                    s_str, e_str = rng.split('-', 1)
+                    s_str = s_str.strip()
+                    e_str = e_str.strip()
+                    if s_str:
+                        if not s_str.isdigit():
+                            print(f"Warning: invalid start in snippet: {spec}", file=sys.stderr)
+                            return None
+                        start = int(s_str)
+                    if e_str:
+                        if not e_str.isdigit():
+                            print(f"Warning: invalid end in snippet: {spec}", file=sys.stderr)
+                            return None
+                        end = int(e_str)
+                else:
+                    if not rng.isdigit():
+                        print(f"Warning: invalid single-line snippet: {spec}", file=sys.stderr)
+                        return None
+                    start = int(rng)
+                    end = start
+                return (p, start, end)
+            except Exception as exc:
+                print(f"Warning: failed parsing snippet spec '{spec}': {exc}", file=sys.stderr)
+                return None
+
+        snippet_specs: List[str] = []
+        if args.snippet:
+            snippet_specs.extend(args.snippet)
+        if args.snippets_file:
+            try:
+                for line in Path(args.snippets_file).read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    snippet_specs.append(line)
+            except Exception as exc:
+                print(f"Warning: failed reading --snippets-file: {exc}", file=sys.stderr)
+
+        snippet_counter = 0
+        for spec in snippet_specs:
+            parsed = _parse_snippet_spec(spec)
+            if not parsed:
+                continue
+            src_path, start_opt, end_opt = parsed
+            try:
+                lines = src_path.read_text().splitlines(keepends=True)
+            except Exception as exc:
+                print(f"Warning: could not read snippet source {src_path}: {exc}", file=sys.stderr)
+                continue
+            total = len(lines)
+            # Defaults: open-start → 1, open-end → EOF
+            start = 1 if start_opt is None else start_opt
+            end = total if end_opt is None else end_opt
+            # Clamp
+            if start < 1:
+                start = 1
+            if end > total:
+                end = total
+            if start > end:
+                print(f"Warning: snippet start > end in '{spec}' after clamping; skipping", file=sys.stderr)
+                continue
+            snippet_text = ''.join(lines[start - 1:end])
+            snippet_bytes = len(snippet_text.encode('utf-8'))
+            if snippet_bytes > max_bytes:
+                print(f"Warning: skipping snippet {spec} due to size {snippet_bytes} bytes (> {max_bytes})", file=sys.stderr)
+                continue
+            # Virtual path under the source's parent; unique leaf
+            try:
+                rel_src = str(src_path.relative_to(current_dir))
+            except ValueError:
+                rel_src = str(src_path)
+            snippet_counter += 1
+            leaf = f"{src_path.name}#snippet-{snippet_counter}"
+            virt = (src_path.parent / leaf)
+            selected.append(virt)
+            file_contents[virt] = snippet_text
+            file_token = count_tokens(snippet_text)
+            file_token_estimates[virt] = int(file_token * 1.2) if file_token is not None else None
+            snippet_meta[virt] = (rel_src, start, end)
+            # Display path
+            try:
+                display_path = str(virt.relative_to(current_dir))
+            except ValueError:
+                display_path = str(virt)
+            file_display_entries.append((display_path, virt))
+
         if args.print_files:
             try:
                 sorted_entries = sorted(file_display_entries, key=lambda item: item[0])
@@ -647,7 +792,7 @@ def main() -> None:
                 print(f"Warning: failed printing file list: {e}", file=sys.stderr)
 
         tree = build_tree(selected, current_dir)
-        xml = generate_xml(tree, file_contents=file_contents)
+        xml = generate_xml(tree, file_contents=file_contents, snippet_meta=snippet_meta)
 
         raw_token_total = count_tokens(xml)
         token_count: Optional[int] = None
