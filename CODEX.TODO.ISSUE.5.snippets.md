@@ -43,3 +43,15 @@ We often need to share just the relevant fragments of files (e.g., log excerpts 
 - [x] 4) Apply `--max_size` to snippets; skip oversize with warning
 - [x] 5) Update README and example_usage
 - [x] 6) Ruff check + smoke tests
+
+## Closure
+Status: Closed.
+
+Summary
+- Implemented snippet inclusion via `--snippet`, `--snippets-file`, `--snippets-only`.
+- Help updated with SNIPPETS section and explicit `--snippets-only` semantics.
+- Snippets render as `<file ... snippet_from="…" start="N" end="M">` (no content headers).
+- README and example_usage updated with examples.
+
+Notes
+- `/tmp` snapshot behavior unchanged; works with snippets.
