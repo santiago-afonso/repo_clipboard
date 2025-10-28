@@ -54,3 +54,12 @@ This ambiguity slows agent workflows and leads to repeated runs. The tool alread
 - [x] 4) Run `uvx ruff check` and fix any errors
 - [x] 5) Smoke test both modes and verify `/tmp` outputs
 - [x] 6) Bump version and show version in `--help`
+
+## Closure
+Issue #4 closed. Summary:
+- Clarified `--help` with explicit output channels, /tmp paths, and examples
+- Always write `/tmp/repo_clipboard.{stdout,stderr}` in both modes
+- Bumped version to 0.1.1 and surfaced in help
+- Updated README and example_usage; ruff clean; smoke tested
+
+Commit: (see git log for the latest on `main`)
