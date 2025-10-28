@@ -61,6 +61,24 @@ class TeeStream:
             pass
 
 
+def get_invocation_cwd() -> Path:
+    """Best-effort to use the caller's working directory.
+
+    Some launchers (e.g., uv --script) may change the process cwd to the script's
+    location. Prefer the shell's original $PWD if available and valid; otherwise
+    fall back to Path.cwd().
+    """
+    try:
+        env_pwd = os.environ.get("PWD")
+        if env_pwd:
+            p = Path(env_pwd).resolve()
+            if p.exists() and p.is_dir():
+                return p
+    except Exception:
+        pass
+    return Path.cwd()
+
+
 def setup_tiktoken_cache() -> None:
     """Set up tiktoken cache directory to avoid SSL issues."""
     # Set cache directory to user's home .cache folder
@@ -546,8 +564,8 @@ def main() -> None:
         if not args.llm:
             print(f"repo_clipboard {__version__}")
 
-        # Always work from current directory
-        current_dir = Path.cwd()
+        # Always work from the caller's directory (prefer $PWD)
+        current_dir = get_invocation_cwd()
         
         # Load file list from current directory
         files = load_file_list_from_current_dir(current_dir, args.git_ignore, verbose=not args.llm)
