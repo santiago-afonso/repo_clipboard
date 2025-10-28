@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.8"
 # dependencies = [
-#     "pathspec>=0.12",
 #     "tiktoken>=0.7.0",
 # ]
 # ///
@@ -10,22 +9,56 @@
 import argparse
 import hashlib
 import os
+import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Union
-
-try:
-    import pathspec
-except Exception as e:  # pathspec not installed, but uv will install automatically
-    print(f"Error importing pathspec: {e}", file=sys.stderr)
-    raise
+from typing import Dict, Optional, Union, TextIO, List, Tuple
 
 try:
     import tiktoken
 except Exception as e:  # tiktoken not installed, but uv will install automatically
     print(f"Error importing tiktoken: {e}", file=sys.stderr)
     raise
+
+
+__version__ = "0.1.1"
+
+
+class TeeStream:
+    """Duplicate writes to the original stream and a secondary file handle."""
+
+    def __init__(self, primary: TextIO, secondary: TextIO) -> None:
+        self.primary = primary
+        self.secondary = secondary
+
+    def write(self, data: str) -> int:
+        written = self.primary.write(data)
+        self.primary.flush()
+        try:
+            self.secondary.write(data)
+            self.secondary.flush()
+        except Exception:
+            # File write failures should not break stderr usage
+            pass
+        return written
+
+    def flush(self) -> None:
+        self.primary.flush()
+        try:
+            self.secondary.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return hasattr(self.primary, "isatty") and self.primary.isatty()
+
+    def close(self) -> None:
+        try:
+            self.secondary.close()
+        except Exception:
+            pass
 
 
 def setup_tiktoken_cache() -> None:
@@ -60,7 +93,7 @@ def setup_tiktoken_cache() -> None:
         pass
 
 
-def count_tokens(text: str) -> int:
+def count_tokens(text: str) -> Optional[int]:
     """Count tokens in text using tiktoken with cl100k_base encoding."""
     try:
         # Set up cache before trying to get encoding
@@ -72,11 +105,54 @@ def count_tokens(text: str) -> int:
     except Exception as e:
         # If token counting fails, just return 0 and warn
         print(f"Warning: Could not count tokens: {e}", file=sys.stderr)
-        return 0
+        return None
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Copy repo contents to Windows clipboard in pseudo XML format, or output for LLM consumption.")
+    parser = argparse.ArgumentParser(
+        description=(
+            f"repo_clipboard {__version__}\n"
+            "\n"
+            "Copy directory contents to Windows clipboard (default) or emit XML on stdout (with --llm).\n"
+            "Always scans recursively from the current directory."
+        ),
+        prog="repo_clipboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "OUTPUT BEHAVIOR\n"
+            "  Clipboard mode (default):\n"
+            "    - XML is copied to the Windows clipboard (via clip.exe on WSL).\n"
+            "    - A copy of the XML is also written to /tmp/repo_clipboard.stdout.\n"
+            "    - Logs/warnings are printed to the terminal and mirrored to /tmp/repo_clipboard.stderr.\n"
+            "\n"
+            "  LLM mode (--llm):\n"
+            "    - XML is printed on stdout (suitable for piping).\n"
+            "    - Metadata (token estimate, file locations) is printed on stderr.\n"
+            "    - Both streams are mirrored to /tmp (stdout → /tmp/repo_clipboard.stdout,\n"
+            "      stderr → /tmp/repo_clipboard.stderr).\n"
+            "\n"
+            "SAVE TO A FILE\n"
+            "  - Quickest: use --llm and redirect stdout:\n"
+            "      repo_clipboard --llm -e py,md > snapshot.xml\n"
+            "  - Or pick up the /tmp copy:\n"
+            "      cp /tmp/repo_clipboard.stdout snapshot.xml\n"
+            "\n"
+            "PIPE TO AN LLM\n"
+            "  - Example with the 'llm' CLI:\n"
+            "      repo_clipboard --llm -e py,md | llm -m wbg:gpt-5-high -s \"Review focus...\" -x\n"
+            "    The token estimate and file paths are printed to stderr so your stdout pipe stays clean.\n"
+            "\n"
+            "FILE LIST & TOKEN ESTIMATES\n"
+            "  - Add --print-files to list included files with approximate token counts.\n"
+            "  - In --llm mode, the list prints to stderr (to keep stdout clean).\n"
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"repo_clipboard {__version__}",
+    )
     parser.add_argument(
         "-e",
         "--extensions",
@@ -103,22 +179,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore-list",
         type=str,
-        help="Path to file containing additional ignore patterns (gitignore syntax)",
+        help="Regex pattern to ignore files (applied to relative file paths). Example: '.*\\.log$|__pycache__'",
     )
     parser.add_argument(
-        "--only-include-list",
+        "--only-include",
         type=str,
-        help="Path to file containing patterns to include (gitignore syntax). Applied after gitignore filtering",
+        help="Regex pattern to include only matching files (applied to relative file paths). Example: '.*\\.py$' for Python files only",
     )
     parser.add_argument(
         "--llm",
         action="store_true",
-        help="LLM mode: output to stdout instead of clipboard, reduce verbose messages, force --git-ignore True",
+        help=(
+            "LLM mode: print XML to stdout (for piping), emit metadata on stderr,"
+            " mirror both to /tmp/repo_clipboard.(stdout|stderr); forces --git-ignore True"
+        ),
     )
     parser.add_argument(
         "--install",
         action="store_true",
         help="Install script into ~/.local/bin and add aliases to .bashrc and Windows PowerShell",
+    )
+    parser.add_argument(
+        "--print-files",
+        action="store_true",
+        help="Print the list of included files (stderr in --llm mode)",
     )
     return parser.parse_args()
 
@@ -194,39 +278,56 @@ def get_git_root(path: Path) -> Path:
     return Path(result.stdout.strip())
 
 
-def load_file_list(repo_root: Path, respect_gitignore: bool, verbose: bool = True) -> list:
-    git_command = ["git", "ls-files", "-c", "-o"]
-    if respect_gitignore:
-        git_command.append("--exclude-standard")
-        if verbose:
-            print("Respecting .gitignore patterns (use --git-ignore False to include all files)")
-    else:
-        if verbose:
-            print("Including all files (ignoring .gitignore patterns)")
-    
-    try:
-        result = subprocess.run(
-            git_command,
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=repo_root,
-        )
-    except subprocess.CalledProcessError as exc:
-        print(f"Error running git ls-files: {exc}", file=sys.stderr)
-        sys.exit(1)
-    files = [repo_root / line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return files
-
-
-def load_file_list_non_git(root_dir: Path, verbose: bool = True) -> list:
-    """Load all files recursively from a non-git directory."""
+def load_file_list_from_current_dir(current_dir: Path, respect_gitignore: bool, verbose: bool = True) -> list:
+    """Load all files recursively from the current directory."""
     if verbose:
-        print(f"Not in a git repository. Loading all files from {root_dir}")
+        print(f"Loading files recursively from {current_dir}")
+    
     files = []
-    for path in root_dir.rglob('*'):
-        if path.is_file():
-            files.append(path)
+    
+    # Check if we're in a git repository and should respect gitignore
+    if respect_gitignore and is_git_repository(current_dir):
+        # Use git ls-files from current directory
+        git_command = ["git", "ls-files", "-c", "-o", "--exclude-standard"]
+        try:
+            result = subprocess.run(
+                git_command,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=current_dir,
+            )
+            # Convert relative paths to absolute paths from current directory
+            git_files = [current_dir / line.strip() for line in result.stdout.splitlines() if line.strip()]
+            
+            # Filter to only include files that are in current directory or subdirectories
+            for file_path in git_files:
+                try:
+                    # Check if file is within current directory
+                    file_path.relative_to(current_dir)
+                    if file_path.is_file():
+                        files.append(file_path)
+                except ValueError:
+                    # File is outside current directory, skip
+                    continue
+                    
+            if verbose:
+                print(f"Using git ls-files, found {len(files)} files respecting .gitignore")
+        except subprocess.CalledProcessError as exc:
+            if verbose:
+                print(f"Warning: git ls-files failed: {exc}, falling back to filesystem scan")
+            # Fallback to filesystem scan
+            for path in current_dir.rglob('*'):
+                if path.is_file():
+                    files.append(path)
+    else:
+        # Direct filesystem scan
+        if verbose and respect_gitignore:
+            print("Not in a git repository or .gitignore disabled, scanning filesystem")
+        for path in current_dir.rglob('*'):
+            if path.is_file():
+                files.append(path)
+    
     return files
 
 
@@ -241,20 +342,28 @@ def build_tree(paths: list, repo_root: Path) -> Dict[str, Union[dict, Path]]:
     return tree
 
 
-def generate_xml(node: Dict[str, Union[dict, Path]], indent: int = 0) -> str:
+def generate_xml(
+    node: Dict[str, Union[dict, Path]],
+    indent: int = 0,
+    file_contents: Optional[Dict[Path, str]] = None,
+) -> str:
     lines = []
     for name, child in sorted(node.items()):
         prefix = " " * indent
         if isinstance(child, dict):
             lines.append(f"{prefix}<directory name=\"{name}\">")
-            lines.append(generate_xml(child, indent + 2))
+            lines.append(generate_xml(child, indent + 2, file_contents=file_contents))
             lines.append(f"{prefix}</directory>")
         else:
-            try:
-                content = child.read_text()
-            except Exception as e:
-                print(f"Could not read {child}: {e}", file=sys.stderr)
-                content = ""
+            content = ""
+            if file_contents is not None and child in file_contents:
+                content = file_contents[child]
+            else:
+                try:
+                    content = child.read_text()
+                except Exception as e:
+                    print(f"Could not read {child}: {e}", file=sys.stderr)
+                    content = ""
             lines.append(f"{prefix}<file name=\"{name}\">{content}</file>")
     return "\n".join(lines)
 
@@ -326,137 +435,298 @@ def get_common_ignore_patterns() -> list:
     ]
 
 
-def load_patterns_from_file(pattern_file: Path) -> list:
-    """Load patterns from a file, one pattern per line, ignoring empty lines and comments."""
-    if not pattern_file.exists():
-        print(f"Warning: Pattern file {pattern_file} not found", file=sys.stderr)
-        return []
+def convert_gitignore_patterns_to_regex(patterns: list) -> list:
+    """Convert gitignore-style patterns to regex patterns for compatibility."""
+    regex_patterns = []
+    for pattern in patterns:
+        # Convert basic gitignore patterns to regex
+        pattern = pattern.strip()
+        if not pattern or pattern.startswith('#'):
+            continue
+            
+        # Escape special regex characters except * and ?
+        pattern = re.escape(pattern)
+        
+        # Convert back escaped wildcards to regex equivalents
+        pattern = pattern.replace(r'\*\*', '.*')  # ** matches any number of directories
+        pattern = pattern.replace(r'\*', '[^/]*')  # * matches anything except /
+        pattern = pattern.replace(r'\?', '.')      # ? matches any single character
+        
+        # Handle directory patterns
+        if pattern.endswith('/'):
+            pattern = pattern[:-1] + '(/.*)?$'
+        else:
+            pattern = pattern + '$'
+            
+        regex_patterns.append(pattern)
     
-    patterns = []
-    with pattern_file.open('r') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                patterns.append(line)
-    return patterns
+    return regex_patterns
 
 
-def apply_pathspec_filters(files: list, repo_root: Path, ignore_patterns: list, include_patterns: list) -> list:
-    """Apply pathspec filters to the file list."""
-    # Convert to relative paths for pathspec matching
-    relative_files = [f.relative_to(repo_root) for f in files]
+def apply_regex_filters(files: list, root_dir: Path, ignore_regex: str = None, include_regex: str = None) -> list:
+    """Apply regex filters to the file list."""
+    # Convert to relative paths for pattern matching
+    relative_files = []
+    for f in files:
+        try:
+            rel_path = f.relative_to(root_dir)
+            relative_files.append((f, str(rel_path)))
+        except ValueError:
+            # File is outside root_dir, skip
+            continue
     
-    # Apply include patterns first if specified
-    if include_patterns:
-        include_spec = pathspec.PathSpec.from_lines('gitwildmatch', include_patterns)
-        relative_files = [f for f in relative_files if include_spec.match_file(f)]
+    # Apply include pattern first if specified
+    if include_regex:
+        try:
+            include_pattern = re.compile(include_regex)
+            relative_files = [(f, rel) for f, rel in relative_files if include_pattern.search(rel)]
+        except re.error as e:
+            print(f"Warning: Invalid include regex pattern '{include_regex}': {e}", file=sys.stderr)
     
-    # Apply ignore patterns
-    if ignore_patterns:
-        ignore_spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
-        relative_files = [f for f in relative_files if not ignore_spec.match_file(f)]
+    # Apply ignore pattern
+    if ignore_regex:
+        try:
+            ignore_pattern = re.compile(ignore_regex)
+            relative_files = [(f, rel) for f, rel in relative_files if not ignore_pattern.search(rel)]
+        except re.error as e:
+            print(f"Warning: Invalid ignore regex pattern '{ignore_regex}': {e}", file=sys.stderr)
     
-    # Convert back to absolute paths
-    return [repo_root / f for f in relative_files]
+    # Return only the file paths
+    return [f for f, rel in relative_files]
+
+
+def apply_common_ignore_patterns(files: list, root_dir: Path) -> list:
+    """Apply common development file ignore patterns using regex."""
+    common_patterns = get_common_ignore_patterns()
+    regex_patterns = convert_gitignore_patterns_to_regex(common_patterns)
+    
+    # Combine all patterns into one big regex with alternation
+    if regex_patterns:
+        combined_pattern = '|'.join(f'({pattern})' for pattern in regex_patterns)
+        return apply_regex_filters(files, root_dir, ignore_regex=combined_pattern)
+    
+    return files
 
 
 def main() -> None:
+    # Handle broken pipe errors gracefully
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    
     args = parse_args()
     script_path = Path(__file__).resolve()
 
-    if args.install:
-        install_script(script_path)
-        return
+    original_stderr = sys.stderr
+    stderr_handle: Optional[TextIO] = None
+    # Always mirror to /tmp in both modes for agent interoperability
+    stdout_path: Optional[Path] = Path("/tmp/repo_clipboard.stdout")
+    stderr_path: Optional[Path] = Path("/tmp/repo_clipboard.stderr")
 
-    # LLM mode forces git-ignore to True
-    if args.llm:
-        args.git_ignore = True
+    try:
+        if args.install:
+            install_script(script_path)
+            return
 
-    # Determine if we're in a git repository
-    current_dir = Path.cwd()
-    is_git_repo = is_git_repository(current_dir)
-    
-    if is_git_repo:
-        repo_root = get_git_root(current_dir)
-        # Load file list with gitignore handling
-        files = load_file_list(repo_root, args.git_ignore, verbose=not args.llm)
-    else:
-        repo_root = current_dir
-        # In non-git mode, we can't respect gitignore
-        if args.git_ignore and not args.llm:
-            print("Warning: --git-ignore flag is ignored in non-git directories")
-        files = load_file_list_non_git(repo_root, verbose=not args.llm)
+        # In --llm mode, enforce .gitignore and set up stderr tee; in non-llm mode,
+        # still tee stderr to /tmp for easier debugging by agents.
+        if args.llm:
+            args.git_ignore = True
+        try:
+            if stderr_path is not None:
+                stderr_handle = stderr_path.open("w", encoding="utf-8")
+                sys.stderr = TeeStream(original_stderr, stderr_handle)
+        except Exception as exc:
+            print(
+                f"Warning: Could not open {stderr_path} for stderr copy: {exc}",
+                file=original_stderr,
+            )
+            stderr_handle = None
+            stderr_path = None
 
-    allowed_extensions = {
-        ext.strip().lstrip('.')
-        for ext in args.extensions.split(',') if ext.strip()
-    }
-    if not allowed_extensions:
-        allowed_extensions = None
+        # Print version info (unless in LLM mode)
+        if not args.llm:
+            print(f"repo_clipboard {__version__}")
 
-    max_bytes = args.max_size * 1024
+        # Always work from current directory
+        current_dir = Path.cwd()
+        
+        # Load file list from current directory
+        files = load_file_list_from_current_dir(current_dir, args.git_ignore, verbose=not args.llm)
 
-    # Load patterns from files
-    ignore_patterns = []
-    include_patterns = []
-    
-    # Add common ignore patterns unless --no-ignore-common is set
-    if not args.no_ignore_common:
-        ignore_patterns.extend(get_common_ignore_patterns())
-        if (is_git_repo or not args.git_ignore) and not args.llm:
-            print("Ignoring common development files (use --no-ignore-common to include all)")
-    
-    if args.ignore_list:
-        ignore_patterns.extend(load_patterns_from_file(Path(args.ignore_list)))
-    
-    if args.only_include_list:
-        include_patterns.extend(load_patterns_from_file(Path(args.only_include_list)))
-    
-    # Apply pathspec filters
-    if ignore_patterns or include_patterns:
-        files = apply_pathspec_filters(files, repo_root, ignore_patterns, include_patterns)
+        allowed_extensions = {
+            ext.strip().lstrip('.')
+            for ext in args.extensions.split(',') if ext.strip()
+        }
+        if not allowed_extensions:
+            allowed_extensions = None
 
-    selected = []
-    for f in files:
-        if allowed_extensions is not None and f.suffix.lstrip('.') not in allowed_extensions:
+        max_bytes = args.max_size * 1024
+
+        # Apply common ignore patterns unless --no-ignore-common is set
+        if not args.no_ignore_common:
+            files = apply_common_ignore_patterns(files, current_dir)
             if not args.llm:
-                print(f"Skipping {f} due to extension")
-            continue
-        try:
-            size = f.stat().st_size
-        except FileNotFoundError:
-            continue
-        if size > max_bytes:
-            print(f"Skipping {f} due to size {size} bytes")
-            continue
-        selected.append(f)
+                print("Ignoring common development files (use --no-ignore-common to include all)")
+        
+        # Apply regex filters
+        ignore_regex = args.ignore_list if args.ignore_list else None
+        include_regex = args.only_include if args.only_include else None
+        
+        if ignore_regex or include_regex:
+            files = apply_regex_filters(files, current_dir, ignore_regex, include_regex)
 
-    tree = build_tree(selected, repo_root)
-    xml = generate_xml(tree)
-
-    if args.llm:
-        # LLM mode: output to stdout
-        print(xml)
-    else:
-        # Normal mode: copy to clipboard
-        try:
-            subprocess.run(["clip.exe"], input=xml, text=True, check=True)
-            print("Copied content to Windows clipboard using clip.exe")
-        except Exception as e:
-            print(f"Failed to copy using clip.exe: {e}", file=sys.stderr)
+        selected = []
+        for f in files:
+            if allowed_extensions is not None and f.suffix.lstrip('.') not in allowed_extensions:
+                if not args.llm:
+                    print(f"Skipping {f} due to extension")
+                continue
             try:
-                import pyperclip  # type: ignore
-                pyperclip.copy(xml)
-                print("Copied content using pyperclip")
-            except Exception as e2:
-                print(f"Also failed to use pyperclip: {e2}", file=sys.stderr)
-                sys.exit(1)
+                size = f.stat().st_size
+            except FileNotFoundError:
+                continue
+            if size > max_bytes:
+                print(f"Skipping {f} due to size {size} bytes")
+                continue
+            selected.append(f)
 
-        print("Done")
+        file_display_entries: List[Tuple[str, Path]] = []
+        file_contents: Dict[Path, str] = {}
+        file_token_estimates: Dict[Path, Optional[int]] = {}
 
-    token_count = int(count_tokens(xml) * 1.2)
-    if token_count > 0 and not args.llm:
-        print(f"Token count: {token_count} tokens")
+        for file_path in selected:
+            try:
+                display_path = str(file_path.relative_to(current_dir))
+            except ValueError:
+                display_path = str(file_path)
+            file_display_entries.append((display_path, file_path))
+
+            try:
+                content = file_path.read_text()
+            except Exception as exc:
+                content = ""
+                file_token_estimates[file_path] = None
+                print(f"Warning: Could not read {file_path}: {exc}", file=sys.stderr)
+            else:
+                raw_tokens = count_tokens(content)
+                if raw_tokens is None:
+                    file_token_estimates[file_path] = None
+                else:
+                    file_token_estimates[file_path] = int(raw_tokens * 1.2)
+            file_contents[file_path] = content
+
+        if args.print_files:
+            try:
+                sorted_entries = sorted(file_display_entries, key=lambda item: item[0])
+                stream = sys.stderr if args.llm else sys.stdout
+                print(f"Included {len(sorted_entries)} files:", file=stream)
+                for display_path, original_path in sorted_entries:
+                    token_value = file_token_estimates.get(original_path)
+                    if token_value is None:
+                        print(f"{display_path} (tokens=unknown)", file=stream)
+                    else:
+                        print(f"{display_path} (tokens={token_value})", file=stream)
+            except Exception as e:
+                print(f"Warning: failed printing file list: {e}", file=sys.stderr)
+
+        tree = build_tree(selected, current_dir)
+        xml = generate_xml(tree, file_contents=file_contents)
+
+        raw_token_total = count_tokens(xml)
+        token_count: Optional[int] = None
+        if raw_token_total is not None:
+            token_count = int(raw_token_total * 1.2)
+        stdout_written = False
+        stdout_error: Optional[Exception] = None
+
+        if args.llm and stdout_path is not None:
+            try:
+                stdout_path.write_text(xml, encoding="utf-8")
+                stdout_written = True
+            except Exception as exc:
+                stdout_error = exc
+                print(
+                    f"Warning: Could not write stdout snapshot to {stdout_path}: {exc}",
+                    file=sys.stderr,
+                )
+
+        if args.llm:
+            # LLM mode: print metadata on stderr, XML payload on stdout
+            location_details = []
+            if stdout_written and stdout_path is not None:
+                location_details.append(f"stdout={stdout_path}")
+            elif stdout_path is not None and stdout_error is not None:
+                location_details.append(f"stdout_failed={stdout_path}")
+            if stderr_handle is not None and stderr_path is not None:
+                location_details.append(f"stderr={stderr_path}")
+
+            warning_messages: List[str] = []
+            if token_count is None:
+                metadata_parts = ["LLM_METADATA tokens=unknown"]
+            else:
+                metadata_parts = [f"LLM_METADATA tokens={token_count}"]
+                if token_count > 900_000:
+                    warning_messages.append(
+                        "Warning - will likely exceed Gemini's input context window"
+                    )
+                if token_count > 270_000:
+                    warning_messages.append(
+                        "Warning - will likely exceed gpt-5's input context window"
+                    )
+            metadata_parts.extend(warning_messages)
+            if location_details:
+                metadata_parts.append("(" + ", ".join(location_details) + ")")
+            print(" ".join(metadata_parts), file=sys.stderr, flush=True)
+            try:
+                print(xml)
+                sys.stdout.flush()
+            except (BrokenPipeError, IOError):
+                # Handle broken pipe gracefully (e.g., when piping to head, grep, etc.)
+                # This is normal when the receiving process terminates early
+                try:
+                    sys.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    sys.stderr.close() 
+                except Exception:
+                    pass
+        else:
+            # Normal mode: write XML to /tmp and copy to clipboard
+            if stdout_path is not None and not stdout_written:
+                try:
+                    stdout_path.write_text(xml, encoding="utf-8")
+                except Exception as exc:
+                    print(
+                        f"Warning: Could not write snapshot to {stdout_path}: {exc}",
+                        file=sys.stderr,
+                    )
+            try:
+                subprocess.run(["clip.exe"], input=xml, text=True, check=True)
+                print("Copied content to Windows clipboard using clip.exe")
+            except Exception as e:
+                print(f"Failed to copy using clip.exe: {e}", file=sys.stderr)
+                try:
+                    import pyperclip  # type: ignore
+                    pyperclip.copy(xml)
+                    print("Copied content using pyperclip")
+                except Exception as e2:
+                    print(f"Also failed to use pyperclip: {e2}", file=sys.stderr)
+                    sys.exit(1)
+
+            print("Done")
+
+        if token_count is not None and token_count > 0 and not args.llm:
+            print(f"Token count: {token_count} tokens")
+            if stdout_path is not None:
+                print(f"Snapshot written to {stdout_path}")
+    finally:
+        # Restore stderr and close tee if used
+        sys.stderr = original_stderr
+        if stderr_handle is not None:
+            try:
+                stderr_handle.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

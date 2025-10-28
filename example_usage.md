@@ -32,7 +32,25 @@ repo_clipboard --llm -e py,md,yml  # or substitute extensions for list you decid
 
 *This streams the pseudo-XML to **stdout** (LLM mode) and respects `.gitignore` automatically.*
 
+When you pass `--print-files` in this mode, each file path is echoed to stderr with its token estimate (20% buffer applied) and a summary metadata line points to `/tmp/repo_clipboard.{stdout,stderr}`. The XML itself remains on stdout so Gemini receives a clean payload.
+
+**Note**: `repo_clipboard` now works from the current directory recursively, not from git repo root. Use regex patterns for advanced filtering:
+
+```bash
+repo_clipboard --llm --only-include ".*\.(py|md|yml)$"  # Using regex for multiple extensions
+```
+
 Always pipe the result into Gemini using **system fragments** (see §4).
+
+### Saving to a file
+- Quickest: use `--llm` and redirect stdout:
+```bash
+repo_clipboard --llm -e py,md > snapshot.xml
+```
+- Or copy the auto-written `/tmp` snapshot (available in both modes):
+```bash
+cp /tmp/repo_clipboard.stdout snapshot.xml
+```
 
 ---
 
@@ -62,6 +80,15 @@ repo_clipboard --llm -e py,md,yml  | llm --sf documentation_auditor -x "The docu
 Claude may provide your own prompt to Gemini using the `-s` flag followed by a string:
 ```bash
 repo_clipboard --llm -e py,md,yml  | llm -s "Claude's prompt to analyze the whole repo goes here" -x
+```
+
+**New regex filtering examples:**
+```bash
+# Only include Python and JavaScript files using regex
+repo_clipboard --llm --only-include ".*\.(py|js)$" | llm --sf arch_review -x
+
+# Exclude test files and cache directories
+repo_clipboard --llm --ignore-list "test_.*|.*_test\.py|__pycache__" | llm --sf arch_review -x
 ```
 
 Claude may also pass a diff to Gemini for evaluation:

@@ -1,19 +1,21 @@
 # repo_clipboard
 
-A command-line tool that copies repository contents to the clipboard in XML format, designed for sharing codebases with Large Language Models (LLMs).
+A command-line tool that copies directory contents to the clipboard in XML format, designed for sharing codebases with Large Language Models (LLMs).
 
 ## Overview
 
-`repo_clipboard` scans your repository, respects `.gitignore` patterns, and formats the file contents into a pseudo-XML structure that's easy for LLMs to parse. It includes token counting, file filtering, and both clipboard and stdout output modes.
+`repo_clipboard` scans your current directory recursively, respects `.gitignore` patterns, and formats the file contents into a pseudo-XML structure that's easy for LLMs to parse. It includes token counting, file filtering with regex patterns, and both clipboard and stdout output modes.
 
 ## Features
 
 - 📋 **Clipboard Integration**: Automatically copies formatted content to Windows clipboard (WSL compatible)
 - 🚫 **Gitignore Support**: Respects `.gitignore` patterns by default
 - 📊 **Token Counting**: Estimates token usage with OpenAI's tiktoken
-- 🎯 **Flexible Filtering**: Filter by file extensions, size limits, and custom patterns
+- 🎯 **Flexible Filtering**: Filter by file extensions, size limits, and regex patterns
 - 🤖 **LLM Mode**: Direct stdout output for piping to other tools
+- 📝 **File List Output**: Optional `--print-files` shows included files with per-file token estimates
 - 🔧 **Easy Installation**: Multiple installation methods including auto-installer
+- 📁 **Current Directory Focus**: Always works from current directory recursively (not git root)
 
 ## Installation
 
@@ -48,14 +50,13 @@ source ~/.bashrc
 - Python 3.8 or higher
 - `uv` (for automatic dependency management)
 - Dependencies (auto-installed by uv):
-  - `pathspec>=0.12`
   - `tiktoken>=0.7.0`
 
 ## Usage
 
 ### Basic Usage
 
-Copy all files in current repository to clipboard:
+Copy all files in current directory to clipboard:
 ```bash
 repo_clipboard
 ```
@@ -72,11 +73,25 @@ repo_clipboard -e py,js,md
 Output to stdout instead of clipboard (useful for piping):
 ```bash
 repo_clipboard --llm -e py,md,yml
+
+# Optionally, print the included files (with token counts) to stderr while keeping XML on stdout
+repo_clipboard --llm -e py,md,yml --print-files
 ```
 
 Example with piping to another tool like `llm` (https://llm.datasette.io/):
 ```bash
 repo_clipboard --llm -e py,md,yml | llm --sf arch_review -x
+```
+
+### Save to a File
+
+- Quickest: use `--llm` and redirect stdout:
+```bash
+repo_clipboard --llm -e py,md > snapshot.xml
+```
+- Or copy the automatically written `/tmp` snapshot (available in both modes):
+```bash
+cp /tmp/repo_clipboard.stdout snapshot.xml
 ```
 
 ### Advanced Filtering
@@ -96,14 +111,14 @@ Include commonly ignored development files:
 repo_clipboard --no-ignore-common
 ```
 
-Use custom ignore patterns:
+Use regex patterns to ignore files:
 ```bash
-repo_clipboard --ignore-list .myignore
+repo_clipboard --ignore-list ".*\.log$|__pycache__"
 ```
 
-Use inclusion patterns:
+Use regex patterns to include only specific files:
 ```bash
-repo_clipboard --only-include-list .myinclude
+repo_clipboard --only-include ".*\.py$"  # Only Python files
 ```
 
 ## Command-Line Options
@@ -114,10 +129,11 @@ repo_clipboard --only-include-list .myinclude
 | `--max_size` | Maximum file size in KB | 50 |
 | `--git-ignore` | Respect .gitignore patterns | True |
 | `--no-ignore-common` | Include common development files/directories | False |
-| `--ignore-list` | Path to file with additional ignore patterns | None |
-| `--only-include-list` | Path to file with inclusion patterns | None |
+| `--ignore-list` | Regex pattern to ignore files (applied to relative file paths) | None |
+| `--only-include` | Regex pattern to include only matching files (applied to relative file paths) | None |
 | `--llm` | Output to stdout instead of clipboard | False |
 | `--install` | Install script to ~/.local/bin | False |
+| `--print-files` | Print the list of included files (stderr in `--llm` mode) | False |
 
 ## Output Format
 
@@ -146,7 +162,14 @@ By default (unless `--no-ignore-common` is used), the tool ignores:
 
 ## Token Counting
 
-The tool uses OpenAI's `cl100k_base` encoding to estimate token usage. The count is displayed after copying to clipboard (adds ~20% buffer for XML formatting).
+The tool uses OpenAI's `cl100k_base` encoding to estimate token usage. Each file listed via `--print-files` includes an estimated token count (with a 20% buffer applied to account for XML markup). After generating the XML, an overall token estimate is emitted:
+
+- In clipboard mode, the total is printed to stdout after the copy operation.
+- In `--llm` mode, metadata such as `LLM_METADATA tokens=4057 (stdout=/tmp/repo_clipboard.stdout, stderr=/tmp/repo_clipboard.stderr)` is printed to **stderr**, while the XML payload stays on **stdout**. This keeps pipelines clean—capture stderr separately if you want to pass the token hint to another tool.
+
+In both modes, snapshots are written under `/tmp` so other processes (including other Codex CLI agents) can pick them up without re-running the command:
+- XML copy: `/tmp/repo_clipboard.stdout`
+- Log copy: `/tmp/repo_clipboard.stderr`
 
 ## Troubleshooting
 
