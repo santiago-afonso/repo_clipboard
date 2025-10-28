@@ -52,6 +52,23 @@ repo_clipboard --llm -e py,md > snapshot.xml
 cp /tmp/repo_clipboard.stdout snapshot.xml
 ```
 
+### Snippets: include file fragments
+
+Precise, token-efficient context via line ranges:
+
+```bash
+repo_clipboard -e md --snippet README.md:1-5 --snippets-only --print-files
+```
+
+Supported forms:
+- Single line: `path:N`
+- Open-end: `path:N-` (from N to EOF)
+- Open-start: `path:-M` (from start to M)
+- Bounded: `path:N-M`
+
+- `--snippets-only` prevents inclusion of non-snippet files.
+- Snippets add XML attributes: `snippet_from`, `start`, `end`.
+
 ---
 
 ## 2. Large-Scale Refactor (LSR) trigger
