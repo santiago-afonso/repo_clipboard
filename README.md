@@ -94,6 +94,24 @@ repo_clipboard --llm -e py,md > snapshot.xml
 cp /tmp/repo_clipboard.stdout snapshot.xml
 ```
 
+### Snippets (file fragments)
+
+Include only the relevant lines from a file using snippets:
+
+```bash
+# Forms: single line, open-end, open-start, bounded
+repo_clipboard -e md --snippet README.md:1       --snippets-only  # single line 1
+repo_clipboard -e md --snippet README.md:10-     --snippets-only  # from 10 to EOF
+repo_clipboard -e md --snippet README.md:-20     --snippets-only  # from start to 20
+repo_clipboard -e md --snippet README.md:5-15    --snippets-only  # lines 5..15
+
+# Or via a file (one spec per line)
+repo_clipboard -e md --snippets-file snippets.txt --snippets-only
+```
+
+- Use `--snippets-only` to include only snippets and prevent inclusion of non-snippet files.
+- Snippets are rendered with attributes on the `<file>` element, e.g. `snippet_from`, `start`, `end`.
+
 ### Advanced Filtering
 
 Set maximum file size (in KB):
