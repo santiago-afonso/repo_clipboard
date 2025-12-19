@@ -67,3 +67,9 @@ Thumbs.db
 Microsoft.PowerShell_profile.ps1
 
 .claude
+
+# Beads (local issue tracking state)
+.beads/
+
+# Codex skill packaging output
+dist/
